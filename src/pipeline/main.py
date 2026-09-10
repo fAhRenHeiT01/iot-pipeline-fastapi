@@ -12,12 +12,18 @@ for p in (repo_root, src_dir):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession  # noqa: E402
 
-from src.pipeline.bronze import start_bronze_ingestion
-from src.pipeline.gold import start_gold_merge
-from src.pipeline.listeners import FleetPipelineListener
-from src.pipeline.silver import start_silver_cleansing
+try:
+    from pipeline.bronze import start_bronze_ingestion  # noqa: E402
+    from pipeline.gold import start_gold_merge  # noqa: E402
+    from pipeline.listeners import FleetPipelineListener  # noqa: E402
+    from pipeline.silver import start_silver_cleansing  # noqa: E402
+except ImportError:
+    from src.pipeline.bronze import start_bronze_ingestion  # noqa: E402
+    from src.pipeline.gold import start_gold_merge  # noqa: E402
+    from src.pipeline.listeners import FleetPipelineListener  # noqa: E402
+    from src.pipeline.silver import start_silver_cleansing  # noqa: E402
 
 
 def main() -> None:
@@ -43,13 +49,13 @@ def main() -> None:
 
     # Start Streaming Tasks
     if args.layer in ("bronze", "all"):
-        bronze_query = start_bronze_ingestion(spark, args.catalog, args.schema)
+        start_bronze_ingestion(spark, args.catalog, args.schema)
 
     if args.layer in ("silver", "all"):
-        silver_query, dlq_query = start_silver_cleansing(spark, args.catalog, args.schema)
+        start_silver_cleansing(spark, args.catalog, args.schema)
 
     if args.layer in ("gold", "all"):
-        gold_query = start_gold_merge(spark, args.catalog, args.schema)
+        start_gold_merge(spark, args.catalog, args.schema)
 
     # Await termination across active streams
     spark.streams.awaitAnyTermination()
@@ -57,4 +63,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

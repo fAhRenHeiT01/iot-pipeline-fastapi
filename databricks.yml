@@ -17,29 +17,57 @@ variables:
     description: "Unity Catalog schema name"
     default: "telemetry"
   sql_warehouse_id:
-    description: "Databricks SQL Warehouse ID for SQL initialization tasks"
+    description: "Databricks SQL Warehouse ID for SQL DDL initialization tasks"
     default: "205bd76b7685e4d1"
+  spark_version:
+    description: "Databricks Runtime (DBR) version for streaming clusters"
+    default: "16.4.x-scala2.12"
+  node_type_id:
+    description: "Worker and driver VM node type ID"
+    default: "Standard_D4ds_v5"
+  min_workers:
+    description: "Minimum worker nodes for cluster autoscaling"
+    default: 1
+  max_workers:
+    description: "Maximum worker nodes for cluster autoscaling"
+    default: 4
 
 targets:
   dev:
     default: true
     mode: development
+    variables:
+      min_workers: 1
+      max_workers: 2
 
   prod:
     mode: production
+    variables:
+      min_workers: 2
+      max_workers: 8
 
 resources:
   jobs:
     fleet_streaming_pipeline:
       name: "[${bundle.target}] Fleet Telemetry Streaming Pipeline"
-      environments:
-        - environment_key: default
-          spec:
-            environment_version: "3"
-            dependencies:
-              - "pydantic>=2.0.0"
-              - "pydantic-settings>=2.0.0"
-              - "pyyaml>=6.0"
+
+      job_clusters:
+        - job_cluster_key: lakehouse_streaming_cluster
+          new_cluster:
+            spark_version: ${var.spark_version}
+            node_type_id: ${var.node_type_id}
+            autoscale:
+              min_workers: ${var.min_workers}
+              max_workers: ${var.max_workers}
+            spark_conf:
+              "spark.sql.streaming.checkpointLocation": "/tmp/checkpoints/fleet_iot"
+              "spark.databricks.delta.optimizeWrite.enabled": "true"
+              "spark.databricks.delta.autoCompact.enabled": "true"
+              "spark.databricks.delta.schema.autoMerge.enabled": "true"
+            custom_tags:
+              ResourceOwner: "DataEngineering"
+              Workload: "FleetStreamingLakehouse"
+              Environment: "${bundle.target}"
 
       tasks:
         # Step 1: Idempotent DDL init task ensuring UC catalog, schema, volumes, and Delta tables exist
@@ -49,11 +77,11 @@ resources:
               path: config/setup_tables.sql
             warehouse_id: ${var.sql_warehouse_id}
 
-        # Step 2: Streaming driver entrypoint for Bronze Layer
+        # Step 2: Streaming driver entrypoint for Bronze Layer (Kafka -> Delta bronze_fleet_raw)
         - task_key: bronze_ingest
           depends_on:
             - task_key: setup_tables
-          environment_key: default
+          job_cluster_key: lakehouse_streaming_cluster
           spark_python_task:
             python_file: src/pipeline/main.py
             parameters:
@@ -63,3 +91,70 @@ resources:
               - "${var.schema}"
               - "--env"
               - "${bundle.target}"
+              - "--layer"
+              - "bronze"
+          libraries:
+            - pypi:
+                package: "pydantic>=2.6.0"
+            - pypi:
+                package: "pydantic-settings>=2.2.0"
+            - pypi:
+                package: "pyyaml>=6.0.1"
+            - pypi:
+                package: "pyarrow>=14.0.0"
+            - pypi:
+                package: "confluent-kafka>=2.3.0"
+
+        # Step 3: Streaming cleansing entrypoint for Silver Layer (Quarantine DLQ & Clean events)
+        - task_key: silver_cleansing
+          depends_on:
+            - task_key: bronze_ingest
+          job_cluster_key: lakehouse_streaming_cluster
+          spark_python_task:
+            python_file: src/pipeline/main.py
+            parameters:
+              - "--catalog"
+              - "${var.catalog}"
+              - "--schema"
+              - "${var.schema}"
+              - "--env"
+              - "${bundle.target}"
+              - "--layer"
+              - "silver"
+          libraries:
+            - pypi:
+                package: "pydantic>=2.6.0"
+            - pypi:
+                package: "pydantic-settings>=2.2.0"
+            - pypi:
+                package: "pyyaml>=6.0.1"
+            - pypi:
+                package: "pyarrow>=14.0.0"
+
+        # Step 4: Streaming aggregation & alert evaluation for Gold Layer (Sliding window & UPSERT)
+        - task_key: gold_aggregation
+          depends_on:
+            - task_key: silver_cleansing
+          job_cluster_key: lakehouse_streaming_cluster
+          spark_python_task:
+            python_file: src/pipeline/main.py
+            parameters:
+              - "--catalog"
+              - "${var.catalog}"
+              - "--schema"
+              - "${var.schema}"
+              - "--env"
+              - "${bundle.target}"
+              - "--layer"
+              - "gold"
+          libraries:
+            - pypi:
+                package: "pydantic>=2.6.0"
+            - pypi:
+                package: "pydantic-settings>=2.2.0"
+            - pypi:
+                package: "pyyaml>=6.0.1"
+            - pypi:
+                package: "pyarrow>=14.0.0"
+            - pypi:
+                package: "pandas>=2.0.0"

@@ -15,7 +15,7 @@ def get_health(db: DatabricksClient = Depends(get_db_client)) -> HealthStatusRes
     """Verify system health, DB connection, and telemetry SLA latency (<120s)."""
     settings = db.settings
     threshold_seconds = settings.SLA_MAX_LATENCY_SECONDS
-    now = datetime.now(timezone.utc)
+    now = datetime.now()
 
     db_connected = False
     latency_seconds = None
@@ -38,9 +38,7 @@ def get_health(db: DatabricksClient = Depends(get_db_client)) -> HealthStatusRes
                         except ValueError:
                             max_ts = None
                     if max_ts:
-                        if max_ts.tzinfo is None:
-                            max_ts = max_ts.replace(tzinfo=timezone.utc)
-                        latency_seconds = max(0.0, (now - max_ts).total_seconds())
+                        latency_seconds = (now - max_ts).total_seconds()
             else:
                 db_connected = False
                 latency_seconds = None

@@ -19,8 +19,8 @@ class MockDatabricksCursor:
         self.query = query
 
     def fetchall(self) -> list[tuple[Any, ...]]:
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc)
+        from datetime import datetime
+        now = datetime.now()
         return [
             (
                 "VH-1001", now, 37.7749, -122.4194, 52.0, 88.0,
@@ -32,10 +32,12 @@ class MockDatabricksCursor:
             ),
         ]
 
-
     def fetchone(self) -> tuple[Any, ...]:
-        from datetime import datetime, timezone
-        return (datetime.now(timezone.utc),)
+        from datetime import datetime
+        return (datetime.now(),)
+
+
+
 
     def close(self) -> None:
         pass

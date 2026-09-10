@@ -72,7 +72,7 @@ TBLPROPERTIES (
 )
 COMMENT 'Cleaned, deduplicated, and speed-clamped telemetry events with 15-min watermark';
 
--- 6. Gold Table: Real-time latest vehicle status
+-- 6. Gold Table: Real-time latest vehicle status with active alerts
 CREATE TABLE IF NOT EXISTS fleet_iot.telemetry.gold_vehicle_status (
     vehicle_id STRING NOT NULL,
     last_event_timestamp TIMESTAMP NOT NULL,
@@ -80,9 +80,9 @@ CREATE TABLE IF NOT EXISTS fleet_iot.telemetry.gold_vehicle_status (
     longitude DOUBLE,
     current_speed_kph DOUBLE NOT NULL,
     engine_temp_c DOUBLE,
-    is_idle BOOLEAN NOT NULL,
-    idle_duration_minutes DOUBLE NOT NULL,
-    has_speed_alert BOOLEAN NOT NULL,
+    engine_status INT,
+    alert_type STRING,
+    alert_details STRING,
     last_updated_at TIMESTAMP NOT NULL
 )
 USING DELTA
@@ -90,5 +90,6 @@ TBLPROPERTIES (
     'delta.autoOptimize.optimizeWrite' = 'true',
     'delta.autoOptimize.autoCompact' = 'true'
 )
-COMMENT 'Real-time vehicle status updated via micro-batch MERGE INTO';
+COMMENT 'Real-time vehicle status and active alerts updated via micro-batch MERGE/UPSERT';
+
 
