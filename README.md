@@ -115,7 +115,7 @@ Built on FastAPI (`src/api/`), connecting directly to the local database or Data
 | Endpoint | Method | Description | SLA / Behavior |
 | :--- | :--- | :--- | :--- |
 | `/fleet/status` | `GET` | Current vehicle status, locations, metrics, and active alerts | Pagination via `limit` / `offset` |
-| `/health` | `GET` | End-to-end freshness health check | Validates $\text{now} - \max(\text{last\_event\_ts}) < 120\text{ s}$ |
+| `/health` | `GET` | End-to-end freshness health check | Validates `now - max(last_event_ts) < 120 s` |
 | `/metrics` | `GET` | Prometheus telemetry metrics | Micro-batch rates, rows/s, and pipeline lag |
 
 ---
