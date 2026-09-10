@@ -1,72 +1,122 @@
 # Fleet Real-time Lakehouse & IoT Pipeline
 
-High-throughput, resilient IoT Fleet Telemetry Lakehouse built on Databricks Structured Streaming, Delta Lake, FastAPI Serving Layer, and a local PySpark & SQLite streaming pipeline.
+High-throughput, resilient IoT Fleet Telemetry Lakehouse featuring real-time Medallion streaming (Bronze, Silver, Gold), automated safety & mechanical anomaly detection, FastAPI operational serving, and an LLM-powered executive reporting architecture.
 
 ---
 
-## Architecture Overview
+## System Architecture
 
 ```
 [IoT Telemetry CLI Generator]
-        │ (SASL/SSL Plaintext / JSON payloads)
+        │ (SASL/SSL JSON payloads)
         ▼
 [Confluent Cloud Kafka: fleet.telemetry.raw]
         │
         ▼
-[Bronze: bronze_fleet_raw (Append-only Parquet / SQLite)]
-        │ (WAL Offset Checkpointing & Idempotent (topic, partition, offset) uniqueness)
+[Bronze: bronze_fleet_raw] ── (WAL Offset Checkpointing & Idempotent Append)
         │
         ├───────────────────────────────────────────────────────┐
-        ▼ (Terminal Garbage Separation)                         ▼
-[Silver DLQ: silver_fleet_quarantine]           [Silver: silver_fleet_events (Clean Parquet / SQLite)]
-(Malformed JSON, null vehicle_id, bad ts)       (10-min Watermark, Dedup on [vid, ts], Clamped speed,
-                                                 Physical layout sorting: sortWithinPartitions)
+        ▼ (Terminal Garbage Quarantine)                         ▼
+[Silver DLQ: silver_fleet_quarantine]           [Silver: silver_fleet_events]
+(Malformed JSON, missing IDs, bad ts)           (10-15m Watermark, Dedup [vid, ts], Clamped speed)
                                                                 │
-                                                                ▼ (10-min Sliding Window & Alert Engine)
-                                                [Gold: gold_vehicle_status (Multi-row Alerts / SQLite)]
-                                                (Multi-row alerts, selective atomic refresh per vehicle,
-                                                 8 telemetry & safety alert rules evaluated)
+                                                                ▼ (Sliding Window & Multi-row Alerts)
+                                                [Gold: gold_vehicle_status]
+                                                (8 Telemetry & Safety Alert Rules, Atomic UPSERT)
                                                                 │
-                                                                ▼
-                                                     [FastAPI Serving Layer]
-                                             ├── GET /fleet/status (Status/Alerts)
-                                             ├── GET /health (SLA Lag < 120s)
-                                             └── GET /metrics (Prometheus stats)
+                                                ┌───────────────┴───────────────┐
+                                                ▼                               ▼
+                                    [FastAPI Serving Layer]       [LLM Daily Summary]
+                                    • GET /fleet/status           • 06:00 UTC Operational Briefing
+                                    • GET /health (SLA < 120s)    • Guardrails & Fallback
+                                    • GET /metrics (Prometheus)   • (See docs/daily_fleet_summary_design.md)
 ```
+
+### Watermarking & Windowing Strategy
+- Enforce a 60-minute event-time watermark on the Bronze-to-Silver streaming pipeline. Drop late-arriving events that exceed the window directly to prevent state store unbounded growth.
+- Evaluate real-time vehicle alerts (such as excessive idling $>10$ minutes) against the continuously updated live Gold table (gold_vehicle_status) with **$10$ minutes sliding window** using micro-batch upserts (MERGE INTO).
+- Decouple downstream analytical aggregations (e.g., the Daily Fleet Summary) from the streaming watermark by implementing them as scheduled batch jobs querying settled Gold/Silver snapshots rather than maintaining divergent streaming watermarks. The **60-minute event-time watermark** will ensure delayed events are passed-through to Silver Layer for correct aggregation of **Daily Fleet Summary**
+
+### Failure Recovery & Huge Backlog Handling
+- Over-partition Kafka topics to a future-proof scale factor (e.g., 16 to 32 partitions) to decouple broker topology from initial cluster sizing.
+```
+Starting with more Kafka partitions than Spark executors is highly recommended.
+
+Normal Traffic: 
+Spark handles this gracefully. If you have 20 Kafka partitions and 5 Spark executors, Spark will naturally assign 4 partitions (tasks) to each executor.
+
+Sudden Backlog: 
+You can seamlessly scale up your Spark cluster to 20 executors. Spark will instantly shift to assigning 1 partition per executor, maximizing your cluster's parallel CPU power without any Kafka configuration changes or data reshuffling.
+```
+
+- Enforce deterministic streaming backpressure purely through Spark Structured Streaming’s `maxOffsetsPerTrigger` configuration in the Kafka read stream.
 
 ---
 
-## Medallion Architecture Processing (`local_pipeline`)
+## Medallion Data Pipeline
 
-The `local_pipeline` reproduces the complete lakehouse Medallion Architecture locally using PySpark Structured Streaming, local Parquet storage, and SQLite:
+The pipeline implements the Medallion architecture with parallel execution targets: local execution via PySpark & SQLite/Parquet (`src/local_pipeline/`), and enterprise cloud execution via Databricks Structured Streaming, Delta Lake, and Unity Catalog (`src/pipeline/` & `databricks.yml`).
 
-### 1. Bronze Layer Processing
-- **Dual Ingestion Sources**: Ingests either live streaming telemetry from Confluent Cloud Kafka (`--source kafka`) or simulated multi-vehicle streaming data from an offline rate generator (`--source generator`).
-- **Write-Ahead Log (WAL) Checkpointing**: PySpark Structured Streaming tracks Kafka offsets into write-ahead logs (`data/checkpoints/bronze`), guaranteeing exactly-once micro-batch offset advancement.
-- **Idempotent Storage**: Micro-batches are persisted to SQLite `bronze_fleet_raw` with a composite `UNIQUE(kafka_topic, kafka_partition, kafka_offset)` constraint using `INSERT OR IGNORE`, preventing duplicate rows across network retries.
-- **Parquet Storage**: Appends raw micro-batches to local lakehouse Parquet storage (`data/lakehouse/bronze`) with automated directory retention pruning.
+### 1. Bronze Layer (Raw Ingestion)
+- **Role**: Append-only ingestion capturing raw telemetry payloads with Kafka message metadata (topic, partition, offset, timestamp).
+- **Guarantees**: Write-Ahead Log (WAL) checkpointing for exactly-once offset advancement; composite uniqueness on `(kafka_topic, kafka_partition, kafka_offset)` ensures idempotent writes across retries.
+- **Implementations**:
+  - **Local**: `src/local_pipeline/bronze.py` writes micro-batches to local Parquet storage (`data/lakehouse/bronze`) and SQLite table `bronze_fleet_raw`.
+  - **Databricks**: `src/pipeline/bronze.py` appends to Delta table `fleet_iot.telemetry.bronze_fleet_raw` with auto-compaction enabled (`config/setup_tables.sql`).
 
-### 2. Silver Layer Processing
-- **Dead Letter Queue (DLQ) Quarantine**: Validates incoming raw JSON payloads and immediately quarantines terminal garbage (corrupt JSON, missing `vehicle_id`, unparseable timestamps, or corrupted/mismatched GPS coordinates) into `silver_fleet_quarantine`.
-- **Event-Time Watermarking (10 Minutes)**: Evaluates event timestamps against a 10-minute watermark boundary (`max_event_ts - 10 minutes`), dropping unrecoverable late-arriving packets and bounding streaming state-store lifecycles.
-- **Stateful Deduplication**: Drops device bursts and network re-transmissions by deduplicating records on the composite key `(vehicle_id, event_timestamp)` within the watermark window.
-- **Sensor Clamping**: Normalizes vehicle speed into valid physical bounds $[0.0, 160.0]\text{ km/h}$ and sets a boolean flag `speed_clamped`. Idle state deduction is removed from Silver and computed dynamically in Gold.
-- **Physical Layout Optimization**: Sorts records via `.sortWithinPartitions("vehicle_id", "event_timestamp")` before writing to Parquet (`data/lakehouse/silver`), ensuring row-group min/max statistics maximize data-skipping efficiency. Indexed in SQLite via `idx_silver_events_vid_ts`.
+### 2. Silver Layer (Cleansing, DLQ & Deduplication)
+- **Role**: Validates payloads, filters terminal garbage, handles sensor drift, and deduplicates network bursts.
+- **Dead Letter Queue (DLQ)**: Records with malformed JSON, missing `vehicle_id`, or unparseable timestamps divert immediately to `silver_fleet_quarantine` without stalling the stream.
+- **Stateful Watermarking & Dedup**: Enforces a 10–15 minute event-time watermark (`max_event_ts - watermark`) and deduplicates across `(vehicle_id, event_timestamp)`.
+- **Sensor Clamping**: Normalizes vehicle speed to physical bounds $[0.0, 160.0]\text{ km/h}$, setting `speed_clamped = true` while preserving `raw_speed_kph` for audits.
+- **Implementations**:
+  - **Local**: `src/local_pipeline/silver.py` applies partition sorting (`sortWithinPartitions`) for Parquet skipping and indexes SQLite table `silver_fleet_events`.
+  - **Databricks**: `src/pipeline/silver.py` streams clean events to `fleet_iot.telemetry.silver_fleet_events` with Delta Lake auto-optimization.
 
-### 3. Gold Layer Processing
-- **10-Minute Sliding Window Horizon**: For each active vehicle in the micro-batch, queries its 10-minute event timeline from the indexed Silver store ending at the batch's latest event timestamp.
-- **Multi-Row Alert Schema**: Replaces legacy flags (`is_idle`, `idle_duration`, `has_speed_alert`) with explicit `alert_type` and `alert_details` columns. Vehicles with multiple concurrent alerts produce multiple rows in `gold_vehicle_status`; vehicles without alerts produce a single row with `alert_type = NULL`.
-- **Selective Atomic Refresh**: In each micro-batch, only vehicles present in the current batch have their Gold records refreshed atomically in SQLite within a transaction (`DELETE` old vehicle records, `INSERT` new evaluated records). Inactive vehicles remain untouched.
-- **8 Critical Business, Safety & Sensor Alerts**:
-  1. **Excessive Idling (`EXCESSIVE_IDLE`)**: Engine on (`engine_status == 1`) and stationary (`speed == 0`) continuously for $> 10\text{ minutes}$ ($600\text{ s}$). Identifies fuel waste and depot delays.
-  2. **Overheating Critical (`OVERHEATING_CRITICAL`)**: Engine temperature $> 75^\circ\text{C}$ continuously for $> 60\text{ seconds}$ to flag imminent cooling/radiator failure.
-  3. **Harsh Braking (`HARSH_BRAKING`)**: Consecutive event differential deceleration $\frac{\Delta\text{speed}}{\Delta t} < -15.0\text{ km/h/s}$.
-  4. **Rapid Acceleration (`RAPID_ACCELERATION`)**: Consecutive event differential acceleration $\frac{\Delta\text{speed}}{\Delta t} > +12.0\text{ km/h/s}$.
-  5. **Overspeeding (`OVERSPEEDING`)**: Sustained speed $> 110\text{ km/h}$ continuously for $\ge 5\text{ minutes}$ ($300\text{ s}$).
-  6. **Ghost Towing / Rollaway (`GHOST_TOWING`)**: Engine off (`engine_status == 0`) while vehicle is moving (`speed > 5 km/h` or rapid GPS coordinate translation $> 5\text{ km/h}$). Flags theft, towing, or runaway vehicles.
-  7. **Cold Engine Hard Acceleration (`COLD_ENGINE_HARD_ACCEL`)**: High speed ($> 60\text{ km/h}$) or rapid acceleration while engine temp $< 50^\circ\text{C}$ (cold coolant), identifying powertrain abuse.
-  8. **Stuck / Frozen Sensor Anomaly (`STUCK_SENSOR_ANOMALY`)**: Perfectly static GPS coordinates or engine temperature reading (zero variance) across $N \ge 5$ moving events (`speed > 10 km/h`).
-  9. **Thermal Spike at Idle (`THERMAL_SPIKE_AT_IDLE`)**: Rapid engine temperature rise ($\ge 5.0^\circ\text{C}$ in $\le 60\text{ s}$ or rate $\ge 0.08^\circ\text{C/s}$) while stationary and idling, signaling cooling fan clutch failure or radiator blockage.
+### 3. Gold Layer (State Aggregation & Alert Engine)
+- **Role**: Computes latest vehicle status, tracks sliding-window telemetry, and generates multi-row business, mechanical, and safety alerts.
+- **Multi-Row Alert Schema**: Vehicles with active alerts output explicit `alert_type` and `alert_details` records. Vehicles operating normally output a single status row with `alert_type = NULL`.
+- **Implementations**:
+  - **Local**: `src/local_pipeline/gold.py` queries a 10-minute historical event window, executes a PySpark `applyInPandas` UDF (`local_pipeline/alerts.py`), and applies selective atomic refresh in SQLite table `gold_vehicle_status`.
+  - **Databricks**: `src/pipeline/gold.py` executes micro-batch `MERGE INTO` on `fleet_iot.telemetry.gold_vehicle_status` keyed by `vehicle_id`.
+
+#### Evaluated Telemetry & Safety Alerts
+| Alert Type | Trigger Condition | Operational Impact |
+| :--- | :--- | :--- |
+| **`EXCESSIVE_IDLE`** | Engine running (`engine_status == 1`), speed $= 0$ for $> 10$ min | Fuel waste & depot turnaround delay |
+| **`OVERHEATING_CRITICAL`** | Engine temperature $> 75^\circ\text{C}$ continuously for $> 60$ s | Imminent cooling system or head gasket failure |
+| **`HARSH_BRAKING`** | Differential deceleration $\frac{\Delta\text{speed}}{\Delta t} < -15.0\text{ km/h/s}$ | Unsafe driving & excessive brake wear |
+| **`RAPID_ACCELERATION`** | Differential acceleration $\frac{\Delta\text{speed}}{\Delta t} > +12.0\text{ km/h/s}$ | Aggressive driving & transmission stress |
+| **`OVERSPEEDING`** | Sustained speed $> 110\text{ km/h}$ continuously for $\ge 5$ min | Speed limit infraction & road safety risk |
+| **`GHOST_TOWING`** | Engine off (`engine_status == 0`), vehicle moving ($> 5\text{ km/h}$) | Vehicle theft, rollaway, or unauthorized towing |
+| **`COLD_ENGINE_HARD_ACCEL`** | Speed $> 60\text{ km/h}$ or hard acceleration while engine $< 50^\circ\text{C}$ | Powertrain abuse & cylinder scoring |
+| **`STUCK_SENSOR_ANOMALY`** | Zero variance in GPS or temp across $N \ge 5$ moving events | Sensor freeze, telemetry glitch, or wire disconnect |
+| **`THERMAL_SPIKE_AT_IDLE`** | Temperature rise $\ge 5^\circ\text{C}$ in $\le 60$ s while stationary and idling | Cooling fan clutch failure or radiator blockage |
+
+---
+
+## LLM-Based Daily Fleet Summary (Design)
+
+The system design defines an automated **Daily Fleet Operational Summary** generated each morning at 06:00 UTC from the Medallion Gold layer for fleet operations executives and depot maintenance leads.
+
+- **Two-Tier Architecture**: Deterministic PySpark batch job pre-aggregates fleet metrics into a partitioned Delta table (`gold_fleet_daily_summary`). A compact ~4 KB JSON fact manifest is then synthesized by an enterprise LLM (e.g., Gemini 1.5 Pro, GPT-4o, Claude 3.5 Sonnet) with zero-math invariants.
+- **Freshness & Watermark Guarantees**: Scheduled at 01:15 UTC with a 60-minute freeze buffer to allow the 10-minute event-time watermark to flush late arrivals. Pre-flight sensors verify Kafka consumer lag $< 100$ and DLQ error ratios $< 2\%$.
+- **Anti-Hallucination Guardrails**: Features a zero-math prompt policy, an automated Regex Claim Cross-Validator matching output numbers to source facts, and a deterministic Jinja2 fallback template in case of model timeouts or API outages.
+- **Multi-Channel Distribution**: Dispatched via FastAPI (`GET /fleet/reports/daily`), Slack `#fleet-ops-daily-briefing`, and executive email digests.
+
+📄 **Full Technical Design**: See [docs/daily_fleet_summary_design.md](/docs/daily_fleet_summary_design.md) for full architecture diagrams, schema contracts, Pydantic models, and risk mitigation strategies.
+
+---
+
+## Serving Layer & API Endpoints
+
+Built on FastAPI (`src/api/`), connecting directly to the local database or Databricks SQL Serverless in production (`src/api/dependencies.py`):
+
+| Endpoint | Method | Description | SLA / Behavior |
+| :--- | :--- | :--- | :--- |
+| `/fleet/status` | `GET` | Current vehicle status, locations, metrics, and active alerts | Pagination via `limit` / `offset` |
+| `/health` | `GET` | End-to-end freshness health check | Validates $\text{now} - \max(\text{last\_event\_ts}) < 120\text{ s}$ |
+| `/metrics` | `GET` | Prometheus telemetry metrics | Micro-batch rates, rows/s, and pipeline lag |
 
 ---
 
@@ -75,93 +125,90 @@ The `local_pipeline` reproduces the complete lakehouse Medallion Architecture lo
 ### 1. Environment Setup
 
 ```bash
-# Copy template environment variables and update the configuration
+# Clone and configure environment variables
 cp .env.example .env.local
 
-# Install in editable mode
+# Install package dependencies in editable mode
 pip install -e ".[dev]"
 ```
 
-### 2. Local Database Initialization
-The local SQLite database schema is defined in `config/setup_local_tables.sql` (the SQLite equivalent of `config/setup_tables.sql`), creating:
-- `bronze_fleet_raw`
-- `silver_fleet_quarantine` (DLQ)
-- `silver_fleet_events`
-- `gold_vehicle_status`
+### 2. Database Initialization
+Initialize schema tables (`bronze_fleet_raw`, `silver_fleet_quarantine`, `silver_fleet_events`, `gold_vehicle_status`):
+- **Local SQLite**: Handled automatically via `config/setup_local_tables.sql`.
+- **Databricks Unity Catalog**: Executed via `config/setup_tables.sql`.
 
-### 3. Running the Local Pipeline & Telemetry Generator
+### 3. Running Telemetry Producer & Streaming Pipeline
 
 #### A. IoT Telemetry Generator CLI (`fleet-producer`)
-
-The telemetry generator simulates connected vehicles emitting telemetry packets with realistic anomaly injection (terminal garbage, duplicate packets, late arrivals, and sensor drift). It can stream directly to Confluent Cloud Kafka or print events locally to stdout in dry-run mode.
+Simulates multi-vehicle streaming telemetry with realistic anomaly injection (corrupt payloads, sensor drift, late arrivals, duplicates):
 
 ```bash
-# 1. Stream events to Confluent Cloud Kafka (5 events/s for 30s across 20 vehicles):
+# Stream to Confluent Cloud Kafka (5 events/s for 30s across 20 vehicles):
 fleet-producer start --rate 5 --duration 30 --vehicles 20
-# Or invoke via module:
-python -m producer.simulate_iot start --rate 5 --duration 30
 
-# 2. Dry-run mode (prints JSON payloads and anomaly labels to stdout without Kafka):
+# Dry-run mode (output to stdout without Kafka):
 fleet-producer start --rate 2 --duration 10 --dry-run
 
-# 3. Generate a quick sample batch of events:
-fleet-producer sample --count 5 --vehicles 10
-
-# 4. Stream indefinitely to a specific topic:
-fleet-producer start --rate 10 --duration 0 --topic fleet.telemetry.raw
+# Shortcut via Makefile:
+make run-producer
 ```
 
-You can also use the Makefile shortcut:
-```bash
-make run-producer          # Runs fleet-producer start --rate 5 --duration 30
-```
-
-#### B. Streaming Pipeline Execution (`local_pipeline`)
-
-The local pipeline ingests from either Confluent Cloud Kafka or the built-in offline rate generator:
+#### B. Streaming Pipeline (`local_pipeline`)
+Ingests from Confluent Cloud Kafka or the offline synthetic generator:
 
 ```bash
-# 1. Run local streaming pipeline connected to Kafka (default):
+# Run streaming pipeline with Kafka source:
 python -m local_pipeline.main --source kafka
 
-# 2. Run local streaming pipeline with offline synthetic generator (no Kafka required):
+# Run streaming pipeline with offline synthetic generator:
 python -m local_pipeline.main --source generator
 
-# 3. Reset local database, lakehouse storage, and checkpoints before running:
-python -m local_pipeline.main --source generator --reset
-
-# 4. Check record counts and latest event timestamps across SQLite tables:
-python -m local_pipeline.main --status
-
-# 5. Run a specific streaming layer:
+# Run individual pipeline layers:
 python -m local_pipeline.main --layer bronze --source generator
 python -m local_pipeline.main --layer silver
 python -m local_pipeline.main --layer gold
+
+# Inspect table counts and timestamps:
+python -m local_pipeline.main --status
+
+# Reset checkpoints and database:
+python -m local_pipeline.main --source generator --reset
 ```
 
-You can also use the Makefile shortcuts:
-```bash
-make run-local-pipeline    # Runs with Kafka source
-make run-local-generator   # Runs with offline synthetic generator
-make status-local-db       # Displays SQLite table counts
-make reset-local-db        # Clears checkpoints and local SQLite database
-```
-
----
-
-### 4. Serving Layer & End-to-End Verification
-
+### 4. Serving Layer & Verification
 
 ```bash
-# Start FastAPI (automatically routes queries to SQLite when running locally)
+# Start FastAPI serving layer
 uvicorn api.main:app --reload --port 8000
 
-# Query fleet status (retrieves live vehicle status from SQLite):
+# Query live vehicle status
 curl http://127.0.0.1:8000/fleet/status?limit=10
 
-# Query health check (computes SLA lag against latest SQLite event timestamp):
+# Verify SLA freshness lag (< 120s)
 curl http://127.0.0.1:8000/health
 
 # Run test suite
 pytest
+```
+
+---
+
+## Repository Structure
+
+```
+fleet-realtime-lakehouse/
+├── config/
+│   ├── pipeline_config.yaml            # Watermarks, SLAs, and table identifiers
+│   ├── setup_local_tables.sql          # SQLite local lakehouse schema
+│   └── setup_tables.sql                # Databricks Unity Catalog Delta schema
+├── databricks.yml                      # Databricks Asset Bundle (DAB) declaration
+├── docs/
+│   └── daily_fleet_summary_design.md   # LLM Daily Summary architecture & guardrails
+├── src/
+│   ├── api/                            # FastAPI application and endpoint routers
+│   ├── common/                         # Configuration settings and structured logger
+│   ├── local_pipeline/                 # Local PySpark & SQLite Medallion pipeline
+│   ├── pipeline/                       # Databricks Structured Streaming & Delta MERGE
+│   └── producer/                       # IoT telemetry generator and Typer CLI
+└── tests/                              # Unit, integration, and contract tests
 ```
