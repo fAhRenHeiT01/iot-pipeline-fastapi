@@ -1,0 +1,42 @@
+pipeline:
+  name: fleet_telemetry_streaming
+  version: "1.0.0"
+
+kafka:
+  topic_raw: fleet.telemetry.raw
+  consumer_group: fleet-lakehouse-ingest
+  starting_offsets: latest
+  max_offsets_per_trigger: 10000
+
+tables:
+  catalog: fleet_iot
+  schema: telemetry
+  bronze_table: bronze_fleet_raw
+  silver_clean_table: silver_fleet_events
+  silver_quarantine_table: silver_fleet_quarantine
+  gold_status_table: gold_vehicle_status
+
+paths:
+  checkpoint_base: /tmp/checkpoints/fleet_iot
+  bronze_checkpoint: /tmp/checkpoints/fleet_iot/bronze
+  silver_checkpoint: /tmp/checkpoints/fleet_iot/silver
+  silver_quarantine_checkpoint: /tmp/checkpoints/fleet_iot/quarantine
+  gold_checkpoint: /tmp/checkpoints/fleet_iot/gold
+
+cleaning:
+  watermark_duration: "15 minutes"
+  max_late_arrival_duration: "45 minutes"
+  speed_clamping:
+    min_kph: 0.0
+    max_kph: 160.0
+  gps_bounds:
+    min_latitude: -90.0
+    max_latitude: 90.0
+    min_longitude: -180.0
+    max_longitude: 180.0
+  idle_threshold_minutes: 10
+
+sla:
+  max_lag_seconds: 120
+  health_check_window_seconds: 300
+

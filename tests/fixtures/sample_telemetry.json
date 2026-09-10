@@ -1,0 +1,81 @@
+[
+  {
+    "type": "clean",
+    "payload": {
+      "vehicle_id": "VH-1001",
+      "event_timestamp": "2026-09-08T12:00:00Z",
+      "latitude": 37.7749,
+      "longitude": -122.4194,
+      "speed_kph": 65.5,
+      "engine_temp_c": 91.2,
+      "engine_status": 1,
+      "odometer_km": 15420.0
+    }
+  },
+  {
+    "type": "sensor_noise_excessive_speed",
+    "payload": {
+      "vehicle_id": "VH-1002",
+      "event_timestamp": "2026-09-08T12:01:00Z",
+      "latitude": 37.7812,
+      "longitude": -122.4101,
+      "speed_kph": 220.0,
+      "engine_temp_c": 94.0,
+      "engine_status": 1,
+      "odometer_km": 28190.5
+    }
+  },
+  {
+    "type": "sensor_noise_negative_speed",
+    "payload": {
+      "vehicle_id": "VH-1003",
+      "event_timestamp": "2026-09-08T12:01:30Z",
+      "latitude": 37.7790,
+      "longitude": -122.4150,
+      "speed_kph": -20.0,
+      "engine_temp_c": 87.0,
+      "engine_status": 1,
+      "odometer_km": 34100.2
+    }
+  },
+  {
+    "type": "terminal_garbage_null_vehicle",
+    "payload": {
+      "vehicle_id": null,
+      "event_timestamp": "2026-09-08T12:02:00Z",
+      "latitude": 37.7750,
+      "longitude": -122.4190,
+      "speed_kph": 40.0,
+      "engine_temp_c": 85.0,
+      "engine_status": 1,
+      "odometer_km": 10000.0
+    }
+  },
+  {
+    "type": "terminal_garbage_bad_ts",
+    "payload": {
+      "vehicle_id": "VH-1004",
+      "event_timestamp": "INVALID_TIMESTAMP_FORMAT",
+      "latitude": 37.7750,
+      "longitude": -122.4190,
+      "speed_kph": 35.0,
+      "engine_temp_c": 88.0,
+      "engine_status": 1,
+      "odometer_km": 12000.0
+    }
+  },
+  {
+    "type": "late_arrival_30m",
+    "payload": {
+      "vehicle_id": "VH-1005",
+      "event_timestamp": "2026-09-08T11:30:00Z",
+      "latitude": 37.7700,
+      "longitude": -122.4200,
+      "speed_kph": 50.0,
+      "engine_temp_c": 90.0,
+      "engine_status": 1,
+      "odometer_km": 19000.0
+    }
+  }
+]
+

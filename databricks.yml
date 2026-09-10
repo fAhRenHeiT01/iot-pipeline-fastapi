@@ -1,0 +1,65 @@
+bundle:
+  name: fleet-realtime-lakehouse
+
+include:
+  - resources/*.yml
+
+sync:
+  paths:
+    - src
+    - config
+
+variables:
+  catalog:
+    description: "Unity Catalog name for the IoT Fleet Lakehouse"
+    default: "fleet_iot"
+  schema:
+    description: "Unity Catalog schema name"
+    default: "telemetry"
+  sql_warehouse_id:
+    description: "Databricks SQL Warehouse ID for SQL initialization tasks"
+    default: "205bd76b7685e4d1"
+
+targets:
+  dev:
+    default: true
+    mode: development
+
+  prod:
+    mode: production
+
+resources:
+  jobs:
+    fleet_streaming_pipeline:
+      name: "[${bundle.target}] Fleet Telemetry Streaming Pipeline"
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "3"
+            dependencies:
+              - "pydantic>=2.0.0"
+              - "pydantic-settings>=2.0.0"
+              - "pyyaml>=6.0"
+
+      tasks:
+        # Step 1: Idempotent DDL init task ensuring UC catalog, schema, volumes, and Delta tables exist
+        - task_key: setup_tables
+          sql_task:
+            file:
+              path: config/setup_tables.sql
+            warehouse_id: ${var.sql_warehouse_id}
+
+        # Step 2: Streaming driver entrypoint for Bronze Layer
+        - task_key: bronze_ingest
+          depends_on:
+            - task_key: setup_tables
+          environment_key: default
+          spark_python_task:
+            python_file: src/pipeline/main.py
+            parameters:
+              - "--catalog"
+              - "${var.catalog}"
+              - "--schema"
+              - "${var.schema}"
+              - "--env"
+              - "${bundle.target}"
